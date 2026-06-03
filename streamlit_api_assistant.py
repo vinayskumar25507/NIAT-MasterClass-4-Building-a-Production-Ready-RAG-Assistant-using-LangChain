@@ -1,7 +1,7 @@
-# streamlit-rag.py
+# streamlit_api_assistant.py
 """
 Single-file Streamlit app: Minimal RAG + Agent + Guardrails + Evaluation + LangSmith integration
-Requirements (example): streamlit, langchain-ollama, langchain-chroma, langchain-community, chromadb, langsmith
+Requirements: streamlit, langchain, langchain-groq, langchain-community, chromadb, langsmith, pypdf, sentence-transformers
 """
 
 from dotenv import load_dotenv
@@ -22,9 +22,10 @@ import warnings
 warnings.filterwarnings("ignore", message=".*torch.classes.*")
 
 # -------------------------
-# LangChain + provider imports (v1+)
+# LangChain + provider imports (Cloud Ready)
 # -------------------------
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_groq import ChatGroq
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -42,20 +43,20 @@ except Exception:
     LangSmithClient = None
 
 # -------------------------
-# Config defaults
+# Config defaults (Updated for Cloud)
 # -------------------------
 DEFAULT_CONFIG = {
     "docs_path": "api_docs",
     "db_path": "chroma_fixed_store",
-    "llm_model": "llama3.1",      # pick model that supports tools
-    "embedding_model": "nomic-embed-text",
+    "llm_model": "llama-3.3-70b-versatile",      # Active Groq model
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2", # Free HuggingFace embeddings
     "chunk_size": 800,
     "chunk_overlap": 150,
     "retrieval_k": 5,
 }
 
 # -------------------------
-# UI styling (Dynamic Light/Dark Mode Fix applied)
+# UI styling
 # -------------------------
 THEME = """
 <style>
@@ -124,7 +125,6 @@ def get_langsmith_client(api_key=None):
     if not key:
         return None
     try:
-        # Some SDK versions accept key argument, some use env var
         try:
             client = LangSmithClient(api_key=key)
         except TypeError:
@@ -134,11 +134,9 @@ def get_langsmith_client(api_key=None):
         return None
 
 def find_latest_run(client, project, filter_name_substr=None, limit=20):
-    """Try to find a recent run associated with this project. Return dict with url/run_id if found."""
     if client is None:
         return None
     try:
-        # Attempt several SDK call patterns
         runs = None
         if hasattr(client, "runs") and hasattr(client.runs, "list"):
             runs = list(client.runs.list(project=project, limit=limit))
@@ -150,7 +148,6 @@ def find_latest_run(client, project, filter_name_substr=None, limit=20):
             runs = []
         if not runs:
             return None
-        # If filter_name_substr provided try to match
         if filter_name_substr:
             for r in runs:
                 name = getattr(r, "name", None) or (r.get("name") if isinstance(r, dict) else None)
@@ -158,7 +155,6 @@ def find_latest_run(client, project, filter_name_substr=None, limit=20):
                     run_id = getattr(r, "id", None) or getattr(r, "run_id", None) or (r.get("run_id") if isinstance(r, dict) else None)
                     url = getattr(r, "url", None) or (f"https://smith.langchain.com/o/default/projects/p/{project}/runs/{run_id}" if run_id else None)
                     return {"run_id": run_id, "url": url, "name": name}
-        # Otherwise return first
         r = runs[0]
         run_id = getattr(r, "id", None) or getattr(r, "run_id", None) or (r.get("run_id") if isinstance(r, dict) else None)
         url = getattr(r, "url", None) or (f"https://smith.langchain.com/o/default/projects/p/{project}/runs/{run_id}" if run_id else None)
@@ -183,7 +179,6 @@ def load_documents(docs_path: str):
                 d.metadata.update({"source_file": f.name, "full_path": str(f)})
             docs.extend(loaded)
         except Exception as e:
-            # skip problematic file
             print(f"Failed to load {f}: {e}")
     # PDFs
     for f in sorted(p.glob("*.pdf")):
@@ -197,18 +192,16 @@ def load_documents(docs_path: str):
     return docs
 
 def build_vectorstore(docs, embedding_model, db_path, chunk_size, chunk_overlap):
-    """Build and persist Chroma store. This is called only by user action (rebuild)."""
-    # chunk
+    """Build and persist Chroma store."""
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     splits = splitter.split_documents(docs)
     for i, s in enumerate(splits):
         s.metadata["chunk_id"] = i
-    # clear existing
     if os.path.exists(db_path):
         shutil.rmtree(db_path)
-    embeddings = OllamaEmbeddings(model=embedding_model)
+        
+    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
     vs = Chroma.from_documents(splits, embedding=embeddings, persist_directory=db_path)
-    # try to persist if client supports it
     try:
         vs._client.persist()
     except Exception:
@@ -217,10 +210,8 @@ def build_vectorstore(docs, embedding_model, db_path, chunk_size, chunk_overlap)
 
 @st.cache_resource
 def load_vectorstore(db_path, embedding_model):
-    """Load existing chroma store in read-only way (if supported)."""
-    # instantiate Chroma with persist_directory and embedding function
-    embeddings = OllamaEmbeddings(model=embedding_model)
-    # Chroma wrapper may open existing DB
+    """Load existing chroma store in read-only way."""
+    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
     vs = Chroma(persist_directory=db_path, embedding_function=embeddings)
     return vs
 
@@ -229,7 +220,7 @@ def load_vectorstore(db_path, embedding_model):
 # -------------------------
 def build_rag_chain(vectorstore, llm_model, retrieval_k=5):
     retriever = vectorstore.as_retriever(search_kwargs={"k": retrieval_k})
-    llm = ChatOllama(model=llm_model, temperature=0.1)
+    llm = ChatGroq(model=llm_model, temperature=0.1)
 
     def format_context_for_chain(docs):
         out = []
@@ -246,7 +237,6 @@ def build_rag_chain(vectorstore, llm_model, retrieval_k=5):
         ("system", """ You are a developer assistant. Use ONLY the provided context.
                     If the answer is not present, respond: "I don't have that information in the documentation."
                     Cite chunks as: [chunk X from filename]."""),
-
         ("human", "Context:\n{context}\n\nQuestion: {question}")
     ])
 
@@ -280,7 +270,6 @@ def calculator_tool(expr: str) -> str:
     if any(c not in allowed for c in expr):
         return "Invalid characters in expression. Only digits, + - * / ( ) . and spaces allowed."
     try:
-        # safe eval context
         val = eval(expr, {"__builtins__": {}}, {})
         return str(val)
     except Exception as e:
@@ -292,7 +281,6 @@ def doc_search_tool(query: str, k: int = 3) -> str:
     """
     Retrieve top-k matching documentation chunks for the given query.
     Returns a formatted string with chunk id, source filename and preview.
-    This tool relies on the 'retriever' being present in st.session_state (populated after index build).
     """
     if not query:
         return "No query provided."
@@ -300,11 +288,10 @@ def doc_search_tool(query: str, k: int = 3) -> str:
         retriever = st.session_state.get("retriever")
         if retriever is None:
             return "Retriever not available (build the index first)."
-        # call retriever; prefer invoke if available
         if hasattr(retriever, "invoke"):
             docs = retriever.invoke(query)[:k]
         else:
-            docs = retriever.get_relevant_documents(query)[:k]  # fallback for some stores
+            docs = retriever.get_relevant_documents(query)[:k] 
         out_lines: List[str] = []
         for d in docs:
             src = d.metadata.get("source_file", "unknown")
@@ -316,9 +303,8 @@ def doc_search_tool(query: str, k: int = 3) -> str:
         return f"doc_search_tool error: {e}"
 
 
-# Agent factory
 def create_tool_agent(llm_model, tools):
-    llm = ChatOllama(model=llm_model, temperature=0.1)
+    llm = ChatGroq(model=llm_model, temperature=0.1)
     agent = create_agent(model=llm, tools=tools, system_prompt="""
 You are an API documentation assistant. Use doc_search for looking up docs and calculator for math.
 Provide concise final answers and cite sources when applicable.
@@ -370,8 +356,8 @@ st.sidebar.title("System Controls")
 # Config inputs
 docs_path = st.sidebar.text_input("Docs folder", DEFAULT_CONFIG["docs_path"])
 db_path = st.sidebar.text_input("Chroma DB path", DEFAULT_CONFIG["db_path"])
-llm_model = st.sidebar.text_input("LLM model (ChatOllama)", DEFAULT_CONFIG["llm_model"])
-embedding_model = st.sidebar.text_input("Embedding model", DEFAULT_CONFIG["embedding_model"])
+llm_model = st.sidebar.text_input("LLM model (ChatGroq)", DEFAULT_CONFIG["llm_model"])
+embedding_model = st.sidebar.text_input("Embedding model (HF)", DEFAULT_CONFIG["embedding_model"])
 chunk_size = st.sidebar.number_input("Chunk size", value=DEFAULT_CONFIG["chunk_size"], step=100)
 chunk_overlap = st.sidebar.number_input("Chunk overlap", value=DEFAULT_CONFIG["chunk_overlap"], step=50)
 retrieval_k = st.sidebar.number_input("Retriever k", value=DEFAULT_CONFIG["retrieval_k"], step=1)
@@ -381,13 +367,6 @@ st.sidebar.markdown("LangSmith (optional)")
 ls_key = st.sidebar.text_input("LangSmith API key", type="password")
 ls_project = st.sidebar.text_input("LangSmith project", value=os.getenv("LANGCHAIN_PROJECT", "api-docs-assistant"))
 enable_langsmith = st.sidebar.checkbox("Enable LangSmith tracing", value=False)
-
-#if enable_langsmith and ls_key:
-#    os.environ["LANGCHAIN_TRACING_V2"] = "true"
-#    os.environ["LANGSMITH_API_KEY"] = ls_key
-#    os.environ["LANGCHAIN_PROJECT"] = ls_project
-#    st.sidebar.success("LangSmith env set for this session")
-
 
 # Persist LangSmith settings across Streamlit refreshes
 if "langsmith_enabled" not in st.session_state:
@@ -419,7 +398,6 @@ st.sidebar.markdown("Index control")
 if "index_built" not in st.session_state:
     st.session_state.index_built = False
 if st.button("Initialize / Rebuild Index"):
-    # build index now
     try:
         st.sidebar.info("Loading documents...")
         docs = load_documents(docs_path)
@@ -488,18 +466,14 @@ with tab_rag:
             if not st.session_state.get("index_built", False):
                 st.error("Index not built. Initialize index in sidebar first.")
             else:
-                # guardrails
                 ok, err = apply_guardrails(q)
                 if not ok:
                     st.error(err)
                 else:
                     with st.spinner("Running RAG..."):
                         try:
-                            # Provide run_name in config so LangSmith may associate a run
                             run_name = f"RAG: {q[:80]}"
-                            # Many rag_chain.invoke accept config; call with best-effort
                             try:
-                                #resp = st.session_state.rag_chain.invoke(q, config={"metadata": {"run_name": run_name}})
                                 resp = st.session_state.rag_chain.invoke(q)
                             except TypeError:
                                 resp = st.session_state.rag_chain.invoke(q)
@@ -508,12 +482,10 @@ with tab_rag:
                             st.markdown(f"<div class='resp-box'>{escape(str(resp))}</div>", unsafe_allow_html=True)
                             st.markdown("</div>", unsafe_allow_html=True)
 
-                            # retrieved context
                             docs = st.session_state.retriever.invoke(q)
                             ctx = format_context_display(docs)
                             st.text_area("Retrieved (top k)", ctx, height=240)
 
-                            # LangSmith: try to find latest run and record
                             if enable_langsmith and ls_key:
                                 client = get_langsmith_client(ls_key)
                                 found = find_latest_run(client, ls_project, filter_name_substr=q[:40])
@@ -564,16 +536,13 @@ with tab_agent:
                                 st.error("Agent not available (model may not support tools).")
                             else:
                                 cfg = {"configurable": {"thread_id": st.session_state.get("agent_thread_id", "thread-default")}}
-                                # Many agents expose .invoke
                                 try:
                                     out = agent.invoke({"messages": [{"role": "user", "content": agent_input}]}, cfg)
                                 except TypeError:
-                                    # fallback to run or call
                                     try:
                                         out = agent.run(agent_input)
                                     except Exception:
                                         out = agent(agent_input)
-                                # extract final text
                                 final = ""
                                 if isinstance(out, dict) and "messages" in out:
                                     last = out["messages"][-1]
@@ -585,7 +554,6 @@ with tab_agent:
                                 st.markdown(f"<div class='resp-box'>{escape(final)}</div>", unsafe_allow_html=True)
                                 st.markdown("</div>", unsafe_allow_html=True)
 
-                                # LangSmith trace capture
                                 if enable_langsmith and ls_key:
                                     client = get_langsmith_client(ls_key)
                                     found = find_latest_run(client, ls_project, filter_name_substr=agent_input[:40])
@@ -668,7 +636,7 @@ with tab_traces:
             qdisplay = run.get("query", "")[:160]
             ts = run.get("ts", "")
             url = run.get("url", "")
-            st.markdown(f"**{escape(qdisplay)}**  ·  <span style='color:var(--muted);font-size:12px'>{ts}</span>", unsafe_allow_html=True)
+            st.markdown(f"**{escape(qdisplay)}** ·  <span style='color:var(--muted);font-size:12px'>{ts}</span>", unsafe_allow_html=True)
             if url:
                 st.markdown(f"[Open Trace ↗]({url})")
             st.markdown("---")
